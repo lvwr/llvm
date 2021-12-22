@@ -111,6 +111,7 @@ CODEGENOPT(IBTSeal, 1, 0)             ///< set to optimize CFProtectionBranch.
 
 CODEGENOPT(IBTFixDirect, 1, 0)        ///< set to skip ENDBRs in direct calls.
 
+CODEGENOPT(IBTPrecedingEndbr, 1, 0)   ///< set to place ENDBRs before function.
 
 CODEGENOPT(XRayInstrumentFunctions , 1, 0) ///< Set when -fxray-instrument is
                                            ///< enabled.

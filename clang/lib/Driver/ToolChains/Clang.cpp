@@ -6620,6 +6620,8 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
 
   Args.AddLastArg(CmdArgs, options::OPT_mibt_fix_direct);
 
+  Args.AddLastArg(CmdArgs, options::OPT_mibt_preceding_endbr);
+
   // Forward -f options with positive and negative forms; we translate these by
   // hand.  Do not propagate PGO options to the GPU-side compilations as the
   // profile info is for the host-side compilation only.

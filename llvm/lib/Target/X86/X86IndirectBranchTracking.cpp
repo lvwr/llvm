@@ -23,6 +23,7 @@
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
+#include "llvm/CodeGen/RegisterScavenging.h"
 
 using namespace llvm;
 
@@ -66,8 +67,12 @@ private:
 
   /// Adds +4 offset to direct calls that are targeting an ENDBR instruction,
   /// preventing control-flow from decoding superfluous instructions.
+  /// Used when -mibt-fix-direct is used
   bool fixDirectCalls(MachineFunction &MF, const Module *M) const;
 
+  /// Adds -4 offset to indirect calls, for when ENDBR is placed before the
+  /// function entry label. Used when -ibt-preceding-endbr is used.
+  bool fixIndirectCalls(MachineFunction &MF) const;
 };
 
 } // end anonymous namespace
@@ -139,71 +144,171 @@ bool X86IndirectBranchTrackingPass::needsPrologueENDBR(const Function *F, const 
   }
 }
 
+bool X86IndirectBranchTrackingPass::fixIndirectCalls(MachineFunction &MF) const {
+  bool Changed = false;
+  bool Deref;
+  bool Preserve;
+  RegScavenger RS;
+
+  const X86Subtarget &SubTarget = MF.getSubtarget<X86Subtarget>();
+  auto TII = SubTarget.getInstrInfo();
+
+  for (auto &BB : MF) {
+    MachineBasicBlock::iterator I = BB.begin();
+    MachineBasicBlock::iterator IE = BB.end();
+    for (; I != IE; I++) {
+      unsigned Opcode = I->getOpcode();
+      unsigned Reg;
+
+      switch(Opcode) {
+        // TODO: Verify if support for JMPXXr/JMPXXm is required (probably not).
+        case X86::CALL64r:
+        case X86::TAILJMPr64:
+        case X86::TAILJMPr:
+        case X86::TAILJMPr64_REX:
+          Deref = false;
+          break;
+        // if this is CALL64m we need to dereference the pointer before sub.
+        case X86::CALL64m:
+        case X86::TAILJMPm64:
+        case X86::TAILJMPm64_REX:
+        case X86::TAILJMPm:
+          Deref = true;
+          break;
+        default:
+          continue;
+      }
+
+      Changed = true;
+
+      // Check if we need to preserve the pointer contents after the call
+      MachineOperand &MO = I->getOperand(0);
+      Reg = MO.getReg();
+      if (!MO.isKill())
+        Preserve = true;
+      else
+        Preserve = false;
+
+      if (Deref) {
+        // If we can't clobber the register, we need a free one.
+        if (Preserve) {
+          RS.enterBasicBlock(BB);
+          RS.forward(I);
+          Reg = RS.FindUnusedReg(&X86::GR64RegClass);
+          // Assuming this is CALL, scratch-regs should always be available...
+          // either way, check just in case.
+          if (!Reg) {
+            WithColor::warning() << "IBT: Regs no available in "
+              << MF.getName() << ". Fallbacking into R10.\n";
+            Reg = X86::R10;
+          }
+        }
+        // Load CALL64m pointer from memory, so we can adjust the offset.
+        // This MOV will be placed before the SUB in the final binary.
+        auto MIB = BuildMI(BB, I, DebugLoc(), TII->get(X86::MOV64rm), Reg);
+        for (unsigned int i = 0; i < I->getNumOperands(); i++) {
+          MO = I->getOperand(i);
+          MIB.add(I->getOperand(i));
+        }
+
+        BuildMI(BB, I, DebugLoc(), TII->get(X86::SUB64ri8), Reg)
+          .addReg(Reg)
+          .addImm(0x4);
+
+        // replace the memory-based operation by a reg-based operation
+        if (Opcode == X86::CALL64m) {
+          MIB = BuildMI(BB, I, DebugLoc(), TII->get(X86::CALL64r), Reg);
+        } else {
+          MIB = BuildMI(BB, I, DebugLoc(), TII->get(X86::TAILJMPr64), Reg);
+        }
+        I->removeFromParent();
+        I = *MIB;
+      } else {
+        BuildMI(BB, I, DebugLoc(), TII->get(X86::SUB64ri8), Reg)
+          .addReg(Reg)
+          .addImm(0x4);
+
+        // if calling from reg that needs to be preserved, restore its value.
+        if (Preserve) {
+          BuildMI(BB, std::next(I), DebugLoc(), TII->get(X86::ADD64ri8), Reg)
+            .addReg(Reg)
+            .addImm(0x4);
+        }
+      }
+    }
+  }
+  return Changed;
+}
+
 bool X86IndirectBranchTrackingPass::fixDirectCalls(MachineFunction &MF, const Module *M) const {
   bool Changed = false;
   for (auto &BB : MF) {
     for (auto &I : BB) {
-      unsigned Opcode = I.getOpcode();
-      if (Opcode == X86::CALL64pcrel32 || Opcode == X86::TAILJMPd ||
-          Opcode == X86::TAILJMPd64_CC || Opcode == X86::TAILJMPd_CC ||
-          Opcode == X86::TAILJMPd64) {
-
-        auto &O = I.getOperand(0);
-        if (O.getOffset()) {
-          LLVM_DEBUG(StringRef name = MF.getName();
-                     WithColor::Warning << "X86/IBT: Duplicated offset for "
-                                           "ENDBR in " << name << "\n";);
+      switch(I.getOpcode()) {
+        case X86::CALL64pcrel32:
+        case X86::TAILJMPd:
+        case X86::TAILJMPd64_CC:
+        case X86::TAILJMPd_CC:
+        case X86::TAILJMPd64:
+          break;
+        default:
           continue;
-        }
+      }
+      auto &O = I.getOperand(0);
+      if (O.getOffset()) {
+        LLVM_DEBUG(StringRef name = MF.getName();
+            WithColor::Warning << "X86/IBT: Duplicated offset for "
+            "ENDBR in " << name << "\n";);
+        continue;
+      }
 
-        // We don't know if Symbols/MCSymbols are emitted with ENDBR, so we
-        // skip and don't fix direct calls to these.
-        // if (O.isSymbol() || O.isMCSymbol()) {
-        //    O.setOffset(ENDBR_LEN);
-        //    continue;
-        // }
+      // We don't know if Symbols/MCSymbols are emitted with ENDBR, so we
+      // skip and don't fix direct calls to these.
+      // if (O.isSymbol() || O.isMCSymbol()) {
+      //    O.setOffset(ENDBR_LEN);
+      //    continue;
+      // }
 
-        if (O.isGlobal()) {
-          const Value *Target = O.getGlobal();
-          const GlobalAlias *GAlias = dyn_cast_or_null<GlobalAlias>(Target);
+      if (O.isGlobal()) {
+        const Value *Target = O.getGlobal();
+        const GlobalAlias *GAlias = dyn_cast_or_null<GlobalAlias>(Target);
 
-          // TODO: These aliasing checks may not be needed with LTO. Handle it.
-          if (GAlias && GAlias->hasWeakLinkage()) {
-            // We can't assume if a weak alias will be ENDBR'ed, so just skip.
+        // TODO: These aliasing checks may not be needed with LTO. Handle it.
+        if (GAlias && GAlias->hasWeakLinkage()) {
+          // We can't assume if a weak alias will be ENDBR'ed, so just skip.
+          continue;
+        } else {
+          // If not a weak alias, we should be able to get the call target.
+          // Check if static, addr-taken or weak-aliasee then fix call offset.
+          Target = Target->stripPointerCastsAndAliases();
+          if (!Target) {
+            LLVM_DEBUG(StringRef name = MF.getName();
+                WithColor::Warning << "X86/IBT: Unknown alias target"
+                " in " << name << "\n";);
             continue;
-          } else {
-            // If not a weak alias, we should be able to get the call target.
-            // Check if static, addr-taken or weak-aliasee then fix call offset.
-            Target = Target->stripPointerCastsAndAliases();
-            if (!Target) {
-              LLVM_DEBUG(StringRef name = MF.getName();
-                         WithColor::Warning << "X86/IBT: Unknown alias target"
-                                               " in " << name << "\n";);
-              continue;
-            }
-            const Function *F = dyn_cast_or_null<Function>(Target);
-            if (!F) {
-              LLVM_DEBUG(StringRef name = MF.getName();
-                         WithColor::Warning << "X86/IBT: Unknown alias target"
-                                               " in " << name << "\n";);
-              continue;
-            }
-            if (IsWeakAliasee(F)) {
-              LLVM_DEBUG(StringRef name = MF.getName();
-                         WithColor::Warning << "X86/IBT: Can't fix direct call"
-                                               " in " << name << "\n";);
-              continue;
-            }
-            const X86TargetMachine *TM =
-              static_cast<const X86TargetMachine *>(&MF.getTarget());
+          }
+          const Function *F = dyn_cast_or_null<Function>(Target);
+          if (!F) {
+            LLVM_DEBUG(StringRef name = MF.getName();
+                WithColor::Warning << "X86/IBT: Unknown alias target"
+                " in " << name << "\n";);
+            continue;
+          }
+          if (IsWeakAliasee(F)) {
+            LLVM_DEBUG(StringRef name = MF.getName();
+                WithColor::Warning << "X86/IBT: Can't fix direct call"
+                " in " << name << "\n";);
+            continue;
+          }
+          const X86TargetMachine *TM =
+            static_cast<const X86TargetMachine *>(&MF.getTarget());
             if (needsPrologueENDBR(F, M, TM)) {
               LLVM_DEBUG(StringRef name = MF.getName();
-                         WithColor::Warning << "X86/IBT: Direct call fixed"
-                                               " in " << name << "\n";);
+                  WithColor::Warning << "X86/IBT: Direct call fixed"
+                  " in " << name << "\n";);
               O.setOffset(ENDBR_LEN);
               Changed = true;
             }
-          }
         }
       }
     }
@@ -245,6 +350,10 @@ bool X86IndirectBranchTrackingPass::runOnMachineFunction(MachineFunction &MF) {
   Metadata *IBTFixDirectCalls = M->getModuleFlag("ibt-fix-direct");
   if (IBTFixDirectCalls)
     Changed |= fixDirectCalls(MF, M);
+
+  Metadata *IBTPrecedingEndbr = M->getModuleFlag("ibt-preceding-endbr");
+  if (IBTPrecedingEndbr)
+    Changed |= fixIndirectCalls(MF);
 
   for (auto &MBB : MF) {
     // Find all basic blocks that their address was taken (for example

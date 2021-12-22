@@ -1420,6 +1420,9 @@ public:
   /// Return the noop instruction to use for a noop.
   virtual MCInst getNop() const;
 
+  /// Return the endbr instruction to use for a endbr.
+  virtual MCInst getEndbr() const;
+
   /// Return true for post-incremented instructions.
   virtual bool isPostIncrement(const MachineInstr &MI) const { return false; }
 

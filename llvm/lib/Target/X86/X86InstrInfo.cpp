@@ -8039,6 +8039,16 @@ MCInst X86InstrInfo::getNop() const {
   return Nop;
 }
 
+/// Return the endbr instruction to use for a endbr.
+MCInst X86InstrInfo::getEndbr() const {
+  MCInst Endbr;
+  if (Subtarget.is64Bit())
+    Endbr.setOpcode(X86::ENDBR64);
+  else
+    Endbr.setOpcode(X86::ENDBR32);
+  return Endbr;
+}
+
 bool X86InstrInfo::isHighLatencyDef(int opc) const {
   switch (opc) {
   default: return false;

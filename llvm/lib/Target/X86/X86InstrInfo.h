@@ -444,6 +444,8 @@ public:
 
   MCInst getNop() const override;
 
+  MCInst getEndbr() const override;
+
   bool
   reverseBranchCondition(SmallVectorImpl<MachineOperand> &Cond) const override;
 

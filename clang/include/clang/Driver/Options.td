@@ -1937,7 +1937,8 @@ def mibt_seal : Flag<["-"], "mibt-seal">, Group<m_Group>, Flags<[CoreOption, CC1
   HelpText<"Optimize fcf-protection=branch/full (requires LTO).">;
 def mibt_fix_direct : Flag<["-"], "mibt-fix-direct">, Group<m_Group>, Flags<[CoreOption, CC1Option]>,
   HelpText<"Fix direct calls to skip ENDBRs when possible.">;
-
+def mibt_preceding_endbr : Flag<["-"], "mibt-preceding-endbr">, Group<m_Group>, Flags<[CoreOption, CC1Option]>,
+  HelpText<"Place ENDBRs before function entry labels.">;
 
 defm xray_instrument : BoolFOption<"xray-instrument",
   LangOpts<"XRayInstrument">, DefaultFalse,

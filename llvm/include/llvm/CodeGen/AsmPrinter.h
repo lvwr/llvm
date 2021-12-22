@@ -529,6 +529,9 @@ public:
   /// Emit N NOP instructions.
   void emitNops(unsigned N);
 
+  /// Emit Endbr instruction before function entry label.
+  void emitPrecedingENDBR();
+
   //===------------------------------------------------------------------===//
   // Symbol Lowering Routines.
   //===------------------------------------------------------------------===//

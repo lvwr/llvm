@@ -474,6 +474,11 @@ static const TargetRegisterClass *canFoldCopy(const MachineInstr &MI,
 
 MCInst TargetInstrInfo::getNop() const { llvm_unreachable("Not implemented"); }
 
+MCInst TargetInstrInfo::getEndbr() const {
+  llvm_unreachable("Not implemented");
+}
+
+
 std::pair<unsigned, unsigned>
 TargetInstrInfo::getPatchpointUnfoldableRange(const MachineInstr &MI) const {
   switch (MI.getOpcode()) {

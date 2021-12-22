@@ -797,6 +797,11 @@ void AsmPrinter::emitFunctionHeader() {
     CurrentPatchableFunctionEntrySym = CurrentFnBegin;
   }
 
+  auto M = MF->getMMI().getModule();
+  if (M->getModuleFlag("ibt-preceding-endbr")) {
+    emitPrecedingENDBR();
+  }
+
   // Emit the function descriptor. This is a virtual function to allow targets
   // to emit their specific function descriptor. Right now it is only used by
   // the AIX target. The PowerPC 64-bit V1 ELF target also uses function
@@ -3133,6 +3138,18 @@ void AsmPrinter::emitNops(unsigned N) {
   MCInst Nop = MF->getSubtarget().getInstrInfo()->getNop();
   for (; N; --N)
     EmitToStreamer(*OutStreamer, Nop);
+}
+
+void AsmPrinter::emitPrecedingENDBR() {
+  auto &MBB = MF->front();
+  auto &MI = MBB.front();
+  unsigned Opcode = MI.getOpcode();
+  MCInst Endbr = MF->getSubtarget().getInstrInfo()->getEndbr();
+
+  if (Opcode == Endbr.getOpcode()) {
+    emitInstruction(&MI);
+    MI.removeFromParent();
+  }
 }
 
 //===----------------------------------------------------------------------===//
