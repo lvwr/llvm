@@ -1935,6 +1935,9 @@ def fcf_protection : Flag<["-"], "fcf-protection">, Group<f_Group>, Flags<[CoreO
   HelpText<"Enable cf-protection in 'full' mode">;
 def mibt_seal : Flag<["-"], "mibt-seal">, Group<m_Group>, Flags<[CoreOption, CC1Option]>,
   HelpText<"Optimize fcf-protection=branch/full (requires LTO).">;
+def mibt_fix_direct : Flag<["-"], "mibt-fix-direct">, Group<m_Group>, Flags<[CoreOption, CC1Option]>,
+  HelpText<"Fix direct calls to skip ENDBRs when possible.">;
+
 
 defm xray_instrument : BoolFOption<"xray-instrument",
   LangOpts<"XRayInstrument">, DefaultFalse,

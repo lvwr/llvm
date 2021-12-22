@@ -1830,6 +1830,9 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
   if (Opts.PrepareForLTO && Args.hasArg(OPT_mibt_seal))
     Opts.IBTSeal = 1;
 
+  if (Args.hasArg(OPT_mibt_fix_direct))
+    Opts.IBTFixDirect = 1;
+
   for (auto *A :
        Args.filtered(OPT_mlink_bitcode_file, OPT_mlink_builtin_bitcode)) {
     CodeGenOptions::BitcodeFileToLink F;

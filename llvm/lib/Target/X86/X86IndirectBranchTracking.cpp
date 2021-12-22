@@ -27,6 +27,7 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "x86-indirect-branch-tracking"
+#define ENDBR_LEN 4
 
 cl::opt<bool> IndirectBranchTracking(
     "x86-indirect-branch-tracking", cl::init(false), cl::Hidden,
@@ -59,6 +60,14 @@ private:
   /// It will add ENDBR32 or ENDBR64 opcode, depending on the target.
   /// \returns true if the ENDBR was added and false otherwise.
   bool addENDBR(MachineBasicBlock &MBB, MachineBasicBlock::iterator I) const;
+
+  /// Checks if the function should get an ENDBR instruction in its prologue.
+  bool needsPrologueENDBR(const Function *F, const Module *M, const X86TargetMachine *TM) const;
+
+  /// Adds +4 offset to direct calls that are targeting an ENDBR instruction,
+  /// preventing control-flow from decoding superfluous instructions.
+  bool fixDirectCalls(MachineFunction &MF, const Module *M) const;
+
 };
 
 } // end anonymous namespace
@@ -67,6 +76,25 @@ char X86IndirectBranchTrackingPass::ID = 0;
 
 FunctionPass *llvm::createX86IndirectBranchTrackingPass() {
   return new X86IndirectBranchTrackingPass();
+}
+
+static bool IsCallReturnTwice(llvm::MachineOperand &MOp) {
+  if (!MOp.isGlobal())
+    return false;
+  auto *CalleeFn = dyn_cast<Function>(MOp.getGlobal());
+  if (!CalleeFn)
+    return false;
+  AttributeList Attrs = CalleeFn->getAttributes();
+  return Attrs.hasFnAttr(Attribute::ReturnsTwice);
+}
+
+static bool IsWeakAliasee(const Function *F) {
+  const Module *M = F->getParent();
+  for (auto &A : M->aliases()) {
+    if (A.getAliasee() == F && A.hasWeakLinkage())
+      return true;
+  }
+  return false;
 }
 
 bool X86IndirectBranchTrackingPass::addENDBR(
@@ -85,25 +113,11 @@ bool X86IndirectBranchTrackingPass::addENDBR(
   return false;
 }
 
-static bool IsCallReturnTwice(llvm::MachineOperand &MOp) {
-  if (!MOp.isGlobal())
-    return false;
-  auto *CalleeFn = dyn_cast<Function>(MOp.getGlobal());
-  if (!CalleeFn)
-    return false;
-  AttributeList Attrs = CalleeFn->getAttributes();
-  return Attrs.hasFnAttr(Attribute::ReturnsTwice);
-}
-
 // Checks if function should have an ENDBR in its prologue
-static bool needsPrologueENDBR(MachineFunction &MF, const Module *M) {
-  Function &F = MF.getFunction();
-
-  if (F.doesNoCfCheck())
+bool X86IndirectBranchTrackingPass::needsPrologueENDBR(const Function *F, const Module *M, const X86TargetMachine *TM) const {
+  if (F->doesNoCfCheck())
     return false;
 
-  const X86TargetMachine *TM =
-      static_cast<const X86TargetMachine *>(&MF.getTarget());
   Metadata *IBTSeal = M->getModuleFlag("ibt-seal");
 
   switch (TM->getCodeModel()) {
@@ -115,14 +129,86 @@ static bool needsPrologueENDBR(MachineFunction &MF, const Module *M) {
   case CodeModel::Kernel:
     // Check if ibt-seal was enabled (implies LTO is being used).
     if (IBTSeal) {
-      return F.hasAddressTaken();
+      return F->hasAddressTaken();
     }
     // if !IBTSeal, fall into default case.
     LLVM_FALLTHROUGH;
   // Address taken or externally linked functions may be reachable.
   default:
-    return (F.hasAddressTaken() || !F.hasLocalLinkage());
+    return (F->hasAddressTaken() || !F->hasLocalLinkage());
   }
+}
+
+bool X86IndirectBranchTrackingPass::fixDirectCalls(MachineFunction &MF, const Module *M) const {
+  bool Changed = false;
+  for (auto &BB : MF) {
+    for (auto &I : BB) {
+      unsigned Opcode = I.getOpcode();
+      if (Opcode == X86::CALL64pcrel32 || Opcode == X86::TAILJMPd ||
+          Opcode == X86::TAILJMPd64_CC || Opcode == X86::TAILJMPd_CC ||
+          Opcode == X86::TAILJMPd64) {
+
+        auto &O = I.getOperand(0);
+        if (O.getOffset()) {
+          LLVM_DEBUG(StringRef name = MF.getName();
+                     WithColor::Warning << "X86/IBT: Duplicated offset for "
+                                           "ENDBR in " << name << "\n";);
+          continue;
+        }
+
+        // We don't know if Symbols/MCSymbols are emitted with ENDBR, so we
+        // skip and don't fix direct calls to these.
+        // if (O.isSymbol() || O.isMCSymbol()) {
+        //    O.setOffset(ENDBR_LEN);
+        //    continue;
+        // }
+
+        if (O.isGlobal()) {
+          const Value *Target = O.getGlobal();
+          const GlobalAlias *GAlias = dyn_cast_or_null<GlobalAlias>(Target);
+
+          // TODO: These aliasing checks may not be needed with LTO. Handle it.
+          if (GAlias && GAlias->hasWeakLinkage()) {
+            // We can't assume if a weak alias will be ENDBR'ed, so just skip.
+            continue;
+          } else {
+            // If not a weak alias, we should be able to get the call target.
+            // Check if static, addr-taken or weak-aliasee then fix call offset.
+            Target = Target->stripPointerCastsAndAliases();
+            if (!Target) {
+              LLVM_DEBUG(StringRef name = MF.getName();
+                         WithColor::Warning << "X86/IBT: Unknown alias target"
+                                               " in " << name << "\n";);
+              continue;
+            }
+            const Function *F = dyn_cast_or_null<Function>(Target);
+            if (!F) {
+              LLVM_DEBUG(StringRef name = MF.getName();
+                         WithColor::Warning << "X86/IBT: Unknown alias target"
+                                               " in " << name << "\n";);
+              continue;
+            }
+            if (IsWeakAliasee(F)) {
+              LLVM_DEBUG(StringRef name = MF.getName();
+                         WithColor::Warning << "X86/IBT: Can't fix direct call"
+                                               " in " << name << "\n";);
+              continue;
+            }
+            const X86TargetMachine *TM =
+              static_cast<const X86TargetMachine *>(&MF.getTarget());
+            if (needsPrologueENDBR(F, M, TM)) {
+              LLVM_DEBUG(StringRef name = MF.getName();
+                         WithColor::Warning << "X86/IBT: Direct call fixed"
+                                               " in " << name << "\n";);
+              O.setOffset(ENDBR_LEN);
+              Changed = true;
+            }
+          }
+        }
+      }
+    }
+  }
+  return Changed;
 }
 
 bool X86IndirectBranchTrackingPass::runOnMachineFunction(MachineFunction &MF) {
@@ -151,10 +237,14 @@ bool X86IndirectBranchTrackingPass::runOnMachineFunction(MachineFunction &MF) {
   EndbrOpcode = SubTarget.is64Bit() ? X86::ENDBR64 : X86::ENDBR32;
 
   // If function is reachable indirectly, mark the first BB with ENDBR.
-  if (needsPrologueENDBR(MF, M)) {
+  if (needsPrologueENDBR(&MF.getFunction(), M, TM)) {
     auto MBB = MF.begin();
     Changed |= addENDBR(*MBB, MBB->begin());
   }
+
+  Metadata *IBTFixDirectCalls = M->getModuleFlag("ibt-fix-direct");
+  if (IBTFixDirectCalls)
+    Changed |= fixDirectCalls(MF, M);
 
   for (auto &MBB : MF) {
     // Find all basic blocks that their address was taken (for example
