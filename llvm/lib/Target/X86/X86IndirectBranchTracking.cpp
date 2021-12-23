@@ -302,7 +302,7 @@ bool X86IndirectBranchTrackingPass::fixDirectCalls(MachineFunction &MF, const Mo
           }
           const X86TargetMachine *TM =
             static_cast<const X86TargetMachine *>(&MF.getTarget());
-            if (needsPrologueENDBR(F, M, TM)) {
+            if (needsPrologueENDBR(F, M, TM) && !F->isDeclaration()) {
               LLVM_DEBUG(StringRef name = MF.getName();
                   WithColor::Warning << "X86/IBT: Direct call fixed"
                   " in " << name << "\n";);
