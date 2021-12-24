@@ -147,7 +147,6 @@ bool X86IndirectBranchTrackingPass::needsPrologueENDBR(const Function *F, const 
 bool X86IndirectBranchTrackingPass::fixIndirectCalls(MachineFunction &MF) const {
   bool Changed = false;
   bool Deref;
-  bool Preserve;
   RegScavenger RS;
 
   const X86Subtarget &SubTarget = MF.getSubtarget<X86Subtarget>();
@@ -181,36 +180,29 @@ bool X86IndirectBranchTrackingPass::fixIndirectCalls(MachineFunction &MF) const 
 
       Changed = true;
 
-      // Check if we need to preserve the pointer contents after the call
-      MachineOperand &MO = I->getOperand(0);
-      Reg = MO.getReg();
-      if (!MO.isKill())
-        Preserve = true;
-      else
-        Preserve = false;
-
       if (Deref) {
-        // If we can't clobber the register, we need a free one.
-        if (Preserve) {
-          RS.enterBasicBlock(BB);
-          RS.forward(I);
-          Reg = RS.FindUnusedReg(&X86::GR64RegClass);
-          // Assuming this is CALL, scratch-regs should always be available...
-          // either way, check just in case.
-          if (!Reg) {
-            WithColor::warning() << "IBT: Regs no available in "
-              << MF.getName() << ". Fallbacking into R10.\n";
-            Reg = X86::R10;
-          }
+        // We'll need to load the function pointer from memory.
+        // Find a free register to do it (don't try to reuse a call's register
+        // used to dereference the memory, because even if it "isKill", the
+        // register may still be required to pass arguments and such.
+        RS.enterBasicBlock(BB);
+        if (I != BB.begin()) RS.forward(std::prev(I));
+        Reg = RS.FindUnusedReg(&X86::GR64RegClass);
+        // Assuming this is CALL, scratch-regs should always be available...
+        // either way, check just in case, and use the scratch R10 if so...
+        if (!Reg) {
+          WithColor::warning() << "IBT: Regs not available in "
+            << MF.getName() << ". Fallbacking into R10.\n";
+          Reg = X86::R10;
         }
         // Load CALL64m pointer from memory, so we can adjust the offset.
         // This MOV will be placed before the SUB in the final binary.
         auto MIB = BuildMI(BB, I, DebugLoc(), TII->get(X86::MOV64rm), Reg);
-        for (unsigned int i = 0; i < I->getNumOperands(); i++) {
-          MO = I->getOperand(i);
-          MIB.add(I->getOperand(i));
-        }
 
+        for (unsigned int i = 0; i < I->getNumOperands(); i++)
+          MIB.add(I->getOperand(i));
+
+        // Adjust the indirect call offset.
         BuildMI(BB, I, DebugLoc(), TII->get(X86::SUB64ri8), Reg)
           .addReg(Reg)
           .addImm(0x4);
@@ -224,6 +216,42 @@ bool X86IndirectBranchTrackingPass::fixIndirectCalls(MachineFunction &MF) const 
         I->removeFromParent();
         I = *MIB;
       } else {
+        MachineOperand &MO = I->getOperand(0);
+        bool Preserve = !MO.isKill();
+        Reg = 0;
+        if (MO.isReg()) Reg = MO.getReg();
+        if (!Reg)
+          llvm_unreachable("weird operand on call register\n");
+
+        // TODO: there is a corner case where we convert:
+        // CALL *RDI into SUB 0x4, RDI; CALL *RDI
+        // and RDI is both a function ptr and an argument to the callee.
+        // Thus we need to make sure that the reg is really available:
+        // Note -- corner case not really seen while compiling the kernel...
+        // ... perhaps this is a little bit of overthinking and tiredness.
+        if (I->hasRegisterImplicitUseOperand(Reg)) {
+          RS.enterBasicBlock(BB);
+          if (I != BB.begin()) RS.forward(std::prev(I));
+          unsigned NReg = RS.FindUnusedReg(&X86::GR64RegClass);
+          if (!Reg) {
+            WithColor::warning() << "IBT: Regs not available in "
+              << MF.getName() << ". Fallbacking into R10.\n";
+            NReg = X86::R10;
+          }
+          // Emit mov to new register and replace call instr
+          BuildMI(BB, I, DebugLoc(), TII->get(X86::MOV64rr), NReg)
+            .addReg(Reg);
+
+          auto MIB = BuildMI(BB, I, DebugLoc(), TII->get(I->getOpcode()), NReg);
+          for (unsigned int i = 1; i < I->getNumOperands(); i++)
+            MIB.add(I->getOperand(i));
+
+          I->removeFromParent();
+          I = *MIB;
+          // We don't need to preserve grabbed free regs.
+          Preserve = false;
+        }
+
         BuildMI(BB, I, DebugLoc(), TII->get(X86::SUB64ri8), Reg)
           .addReg(Reg)
           .addImm(0x4);
